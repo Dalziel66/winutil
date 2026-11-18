@@ -1,0 +1,88 @@
+<!--
+  ============================================================================
+  Theme: VS Code Dark
+  ============================================================================
+  Giao diện tối ban đầu, lấy cảm hứng từ VS Code "Dark Modern".
+  Các vùng nằm sát nhau (không có khe hở), ngăn cách bằng viền 1px.
+  Có activity bar bên trái và thanh trạng thái màu xanh #007ACC.
+
+  File này CHỈ chứa token. Danh sách key bắt buộc: xem themes/README.md.
+-->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+  <!-- Nền -->
+  <SolidColorBrush x:Key="Bg"            Color="#1E1E1E"/>
+  <SolidColorBrush x:Key="BgSide"        Color="#252526"/>
+  <SolidColorBrush x:Key="BgTitle"       Color="#3C3C3C"/>
+  <SolidColorBrush x:Key="BgActivity"    Color="#333333"/>
+  <SolidColorBrush x:Key="BgInput"       Color="#3C3C3C"/>
+  <SolidColorBrush x:Key="BgTabBar"      Color="#252526"/>
+  <SolidColorBrush x:Key="BgTabActive"   Color="#1E1E1E"/>
+  <SolidColorBrush x:Key="BgCard"        Color="#252526"/>
+
+  <!-- Chữ -->
+  <SolidColorBrush x:Key="Fg"            Color="#CCCCCC"/>
+  <SolidColorBrush x:Key="FgMuted"       Color="#A0A0A0"/>
+  <SolidColorBrush x:Key="FgSubtle"      Color="#8B8B8B"/>
+  <SolidColorBrush x:Key="FgStrong"      Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="FgHead"        Color="#BBBBBB"/>
+  <SolidColorBrush x:Key="CommentFg"     Color="#6A9955"/>  <!-- màu comment xanh lá của VS Code -->
+
+  <!-- Viền -->
+  <SolidColorBrush x:Key="Border"          Color="#2B2B2B"/>
+  <SolidColorBrush x:Key="TileBorderBrush" Color="#2B2B2B"/>
+  <SolidColorBrush x:Key="InputBorder"     Color="#3C3C3C"/>
+  <SolidColorBrush x:Key="WindowBorder"    Color="#2B2B2B"/>
+
+  <!-- Điểm nhấn -->
+  <SolidColorBrush x:Key="Accent"          Color="#007ACC"/>
+  <SolidColorBrush x:Key="AccentFg"        Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="TabActiveBorder" Color="#3794FF"/>
+  <SolidColorBrush x:Key="TitleIconFg"     Color="#3794FF"/>
+  <SolidColorBrush x:Key="TabIconFg"       Color="#519ABA"/>
+  <SolidColorBrush x:Key="ActFg"           Color="#858585"/>
+  <SolidColorBrush x:Key="ActFgActive"     Color="#FFFFFF"/>
+
+  <!-- Nút -->
+  <SolidColorBrush x:Key="BtnBg"         Color="#3A3D41"/>
+  <SolidColorBrush x:Key="BtnFg"         Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="BtnBorder"     Color="#3A3D41"/>
+  <SolidColorBrush x:Key="BtnPrimaryBg"  Color="#0E639C"/>
+  <SolidColorBrush x:Key="BtnPrimaryFg"  Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="BtnDangerBg"   Color="#A1260D"/>
+  <SolidColorBrush x:Key="BtnDangerFg"   Color="#FFFFFF"/>
+
+  <!-- Nút tiêu đề -->
+  <SolidColorBrush x:Key="CapFg"         Color="#CCCCCC"/>
+  <SolidColorBrush x:Key="CapHoverBg"    Color="#505050"/>
+  <SolidColorBrush x:Key="CloseHoverBg"  Color="#E81123"/>
+  <SolidColorBrush x:Key="CloseHoverFg"  Color="#FFFFFF"/>
+
+  <!-- Checkbox, scrollbar, chọn chữ, tooltip -->
+  <SolidColorBrush x:Key="CheckBg"       Color="#3C3C3C"/>
+  <SolidColorBrush x:Key="CheckBorder"   Color="#6B6B6B"/>
+  <SolidColorBrush x:Key="ScrollThumb"   Color="#66797979"/>  <!-- ARGB: 40% xám -->
+  <SolidColorBrush x:Key="Selection"     Color="#264F78"/>
+  <SolidColorBrush x:Key="ToolTipBg"     Color="#252526"/>
+
+  <!-- Thanh trạng thái: cả thanh đổi màu (xanh -> cam khi bận), badge trong suốt -->
+  <SolidColorBrush x:Key="StatusBg"      Color="#007ACC"/>
+  <SolidColorBrush x:Key="StatusBusyBg"  Color="#CC6633"/>
+  <SolidColorBrush x:Key="StatusFg"      Color="#FFFFFF"/>
+  <SolidColorBrush x:Key="BadgeBg"       Color="Transparent"/>
+  <SolidColorBrush x:Key="BadgeBusyBg"   Color="Transparent"/>
+  <SolidColorBrush x:Key="BadgeFg"       Color="#FFFFFF"/>
+
+  <!-- Hình học: không khe hở; viền phải + dưới để tách sidebar | editor | terminal -->
+  <Thickness    x:Key="RootPad">0</Thickness>
+  <Thickness    x:Key="TileGap">0</Thickness>
+  <Thickness    x:Key="TileBorder">0,0,1,1</Thickness>
+  <Thickness    x:Key="BtnBorderThickness">0</Thickness>
+  <CornerRadius x:Key="Radius">2</CornerRadius>
+  <CornerRadius x:Key="CardRadius">4</CornerRadius>
+
+  <!-- Hiển thị -->
+  <Visibility x:Key="ClassicChromeVis">Visible</Visibility>
+  <Visibility x:Key="WaybarVis">Collapsed</Visibility>
+</ResourceDictionary>
