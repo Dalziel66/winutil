@@ -248,9 +248,53 @@ function Switch-Theme {
 #         Cách này tránh hẳn việc gọi Dispatcher từ luồng khác.
 #   Busy  true khi đang có tác vụ chạy. Mỗi lần chỉ cho chạy một tác vụ, vì
 #         winget và registry không nên chạy song song.
-$sync = [hashtable]::Synchronized(@{ Busy = $false; LastBusy = $null; Q = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]' })
+#   Prog      tiến trình cài/gỡ app hiện tại (luồng nền ghi, UI timer đọc và vẽ):
+#               Active  đã có lượt chạy nào chưa (để hiện panel PROGRESS)
+#               Total / Index   tổng số app / app thứ mấy đang xử lý (đếm từ 1)
+#               Name    tên app đang xử lý, hoặc dòng tổng kết khi xong
+#               Phase   giai đoạn hiện tại (downloading, installing...)
+#               Detail  chi tiết (vd "12.0 MB / 48.0 MB")
+#               Pct     % tổng của cả lượt (0-100)
+#   AppState  winget id -> trạng thái ngắn hiển thị cạnh checkbox ("queued", "45%", "done"...).
+#             Dùng ConcurrentDictionary vì UI duyệt (enumerate) nó trong khi luồng nền đang ghi.
+#             Hashtable thường sẽ ném lỗi "collection was modified".
+$sync = [hashtable]::Synchronized(@{
+    Busy = $false; LastBusy = $null
+    Q        = New-Object 'System.Collections.Concurrent.ConcurrentQueue[string]'
+    Prog     = [hashtable]::Synchronized(@{ Active = $false; Total = 0; Index = 0; Name = ''; Phase = ''; Detail = ''; Pct = 0 })
+    AppState = New-Object 'System.Collections.Concurrent.ConcurrentDictionary[string,string]'
+})
 
 # Code được chèn vào đầu MỌI tác vụ nền: các hàm tiện ích có sẵn trong runspace.
+#
+# Theo dõi tiến trình winget:
+#  - Invoke-Winget chạy winget.exe bằng System.Diagnostics.Process, đọc stdout bất đồng bộ
+#    (ReadLineAsync + Wait 400ms) để trong lúc winget im lặng vẫn cập nhật được tiến trình.
+#  - % TẢI: đã kiểm chứng (winget 1.x) là khi stdout bị chuyển hướng, winget KHÔNG in thanh
+#    tải. Đo kích thước file cũng không được, vì winget tải qua Delivery Optimization (DO)
+#    vào cache riêng rồi mới copy sang. Cách đúng là hỏi chính DO:
+#      Get-DeliveryOptimizationStatus  -> mỗi lượt tải có SourceURL, FileSize, TotalBytesDownloaded
+#      (PredefinedCallerApplication = "Windows Package Manager").
+#      Dòng "Downloading <url>" của winget cho biết URL -> lọc đúng lượt tải đó -> % + MB + tốc độ.
+#    Nếu không có DO (cmdlet thiếu, hoặc winget cấu hình downloader = wininet) thì hiện số
+#    giây đã tải. Nếu một phiên bản winget nào đó CÓ in "12.0 MB / 48.0 MB" ra stdout thì
+#    Read-WingetLine vẫn đọc được (mỗi dòng được cắt thêm ở '\r').
+#  - Giai đoạn chạy installer (có thể vài phút, không có output): hiện số giây đã trôi qua,
+#    để người dùng biết tool không bị treo.
+#  - Read-WingetLine phân loại từng dòng:
+#      "12.0 MB / 48.0 MB"           -> % tải (không ghi log, tránh spam)
+#      "Found ..." / "Downloading ..." / "Successfully verified installer hash" /
+#      "Starting package install..." -> chuyển giai đoạn + ghi log
+#      dòng không có chữ (spinner, thanh bar) -> bỏ qua
+#    Các mẫu này là output tiếng Anh của winget. Nếu winget hiển thị ngôn ngữ khác thì vẫn
+#    cài bình thường, chỉ là panel ít chi tiết hơn (vẫn có app thứ mấy và kết quả cuối).
+#  - Set-Phase quy đổi giai đoạn ra % tổng bằng trọng số $PhaseWeight. Giai đoạn tải chiếm
+#    khoảng 10% -> 70% của mỗi app, theo đúng % tải thật.
+#  - Mã thoát winget (int32 có dấu):
+#      0            thành công
+#      -1978335189  0x8A15002B  đã cài và không có bản mới hơn  -> "up to date"
+#      -1978334967  0x8A150109  cài xong nhưng cần khởi động lại  -> "done (reboot)"
+#      khác         lỗi (xem dòng log ngay trên exit code trong TERMINAL)
 $Prelude = @'
 $ProgressPreference = 'SilentlyContinue'
 function Log($m) { $sync.Q.Enqueue(('[{0}] {1}' -f (Get-Date -Format HH:mm:ss), $m)) }
@@ -260,11 +304,123 @@ function Set-Reg($Path, $Name, $Value) {
     $type = if ($Value -is [string]) { 'String' } else { 'DWord' }
     Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $type -Force
 }
-function Invoke-Winget([string[]]$WArgs) {
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { throw 'winget not found. Install "App Installer" from Microsoft Store.' }
-    # Lọc bỏ các dòng progress bar/spinner (không có chữ cái liên tiếp)
-    & winget @WArgs 2>&1 | ForEach-Object { $l = "$_".Trim(); if ($l -match '[A-Za-z]{3}') { Log "  $l" } }
-    Log "  exit code: $LASTEXITCODE"
+
+$PhaseText   = @{ start = 'starting'; found = 'found'; dl = 'downloading'; verify = 'verifying'; install = 'installing'; uninstall = 'removing'; ok = 'done'; latest = 'up to date'; reboot = 'done (reboot)'; fail = 'failed' }
+$PhaseWeight = @{ start = 2; found = 10; dl = 10; verify = 70; install = 80; uninstall = 50; ok = 100; latest = 100; reboot = 100; fail = 100 }
+
+# On: đang theo dõi một lượt tải. Url: URL winget báo. Start: lúc bắt đầu tải.
+# LastPoll: lần hỏi DO gần nhất (giới hạn ~1 lần/giây vì cmdlet tốn ~100ms).
+# PhaseStart: lúc vào giai đoạn hiện tại (để đếm giây khi chạy installer).
+$DlState = @{
+    On = $false; Url = ''; Start = Get-Date; LastPoll = [datetime]::MinValue; PhaseStart = Get-Date
+    HasDO = [bool](Get-Command Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue)
+}
+
+function Format-Size([double]$b) { if ($b -ge 1GB) { '{0:N2} GB' -f ($b / 1GB) } else { '{0:N1} MB' -f ($b / 1MB) } }
+
+function Start-DownloadWatch([string]$Url) { $DlState.On = $true; $DlState.Url = $Url; $DlState.Start = Get-Date }
+
+function Update-DownloadWatch([string]$Id) {
+    if (((Get-Date) - $DlState.LastPoll).TotalMilliseconds -lt 900) { return }
+    $DlState.LastPoll = Get-Date
+    $sec = [math]::Max(1, [int]((Get-Date) - $DlState.Start).TotalSeconds)
+    $job = if ($DlState.HasDO) {
+        Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue | Where-Object SourceURL -eq $DlState.Url | Select-Object -Last 1
+    }
+    if ($job -and $job.FileSize -gt 0) {
+        $got = [double]$job.TotalBytesDownloaded; $all = [double]$job.FileSize
+        $pct = [math]::Min(99, [int](100 * $got / $all))   # 100% chỉ khi winget báo xong
+        Set-Phase $Id 'dl' $pct ('{0} / {1}  {2}/s' -f (Format-Size $got), (Format-Size $all), (Format-Size ($got / $sec)))
+    } else {
+        $sync.Prog.Detail = "downloading... ${sec}s"
+    }
+}
+
+function Set-Phase([string]$Id, [string]$Phase, [int]$Pct = 0, [string]$Detail = '') {
+    if ($Phase -ne 'dl') { $DlState.On = $false }
+    if ($Phase -ne $sync.Prog.LastPhase) { $DlState.PhaseStart = Get-Date; $sync.Prog.LastPhase = $Phase }
+    $w = if ($Phase -eq 'dl') { 10 + [int](0.6 * $Pct) } else { $PhaseWeight[$Phase] }
+    if ($Id) { $sync.AppState[$Id] = if ($Phase -eq 'dl' -and $Pct -gt 0) { "$Pct%" } else { $PhaseText[$Phase] } }
+    $sync.Prog.Phase  = $PhaseText[$Phase]
+    $sync.Prog.Detail = $Detail
+    $sync.Prog.Pct    = [int]((([math]::Max(1, $sync.Prog.Index) - 1) * 100 + $w) / [math]::Max(1, $sync.Prog.Total))
+}
+
+function Read-WingetLine([string]$Line, [string]$Id) {
+    $l = ($Line -replace '\x1b\[[0-9;?]*[A-Za-z]', '').Trim()
+    if (-not $l) { return }
+    $m = [regex]::Match($l, '(?i)([\d.]+)\s*(KB|MB|GB)\s*/\s*([\d.]+)\s*(KB|MB|GB)')
+    if ($m.Success) {
+        $unit = @{ KB = 1KB; MB = 1MB; GB = 1GB }
+        $got = [double]$m.Groups[1].Value * $unit[$m.Groups[2].Value]
+        $all = [double]$m.Groups[3].Value * $unit[$m.Groups[4].Value]
+        $pct = if ($all -gt 0) { [math]::Min(100, [int](100 * $got / $all)) } else { 0 }
+        Set-Phase $Id 'dl' $pct ('{0} {1} / {2} {3}' -f $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value, $m.Groups[4].Value)
+        return
+    }
+    if ($l -notmatch '[A-Za-z]{3}') {
+        $m = [regex]::Match($l, '(\d{1,3})\s*%\s*$')
+        if ($m.Success) { $sync.Prog.Detail = "$($m.Groups[1].Value)%" }
+        return
+    }
+    Log "  $l"
+    switch -Regex ($l) {
+        '^Found '                            { Set-Phase $Id 'found' 0 ($l -replace '^Found ', '') }
+        '^Downloading (\S+)'                 { Set-Phase $Id 'dl' 0 'connecting...'; Start-DownloadWatch $Matches[1] }
+        'verified installer hash'            { Set-Phase $Id 'verify' 0 'installer hash verified' }
+        'Starting package install'           { Set-Phase $Id 'install' 0 'running installer, please wait...' }
+        'Starting package uninstall'         { Set-Phase $Id 'uninstall' 0 'running uninstaller...' }
+        'existing package already installed' { Set-Phase $Id 'found' 0 'already installed, checking for upgrade' }
+    }
+}
+
+function Invoke-Winget([string[]]$WArgs, [string]$Id = '') {
+    $exe = (Get-Command winget -ErrorAction SilentlyContinue).Source
+    if (-not $exe) { throw 'winget not found. Install "App Installer" from Microsoft Store.' }
+    $psi = New-Object Diagnostics.ProcessStartInfo $exe, ($WArgs -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+    $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $p = [Diagnostics.Process]::Start($psi)
+    $task = $p.StandardOutput.ReadLineAsync()
+    while ($true) {
+        if ($task.Wait(400)) {
+            $line = $task.Result
+            if ($null -eq $line) { break }   # winget đã đóng stdout
+            foreach ($part in $line -split "`r") { $null = Read-WingetLine $part $Id }
+            $task = $p.StandardOutput.ReadLineAsync()
+        } elseif ($DlState.On) {
+            Update-DownloadWatch $Id
+        } elseif ($sync.Prog.LastPhase -in 'install', 'uninstall') {
+            $base = if ($sync.Prog.LastPhase -eq 'install') { 'running installer' } else { 'running uninstaller' }
+            $sync.Prog.Detail = '{0}... {1}s' -f $base, [int]((Get-Date) - $DlState.PhaseStart).TotalSeconds
+        }
+    }
+    $p.WaitForExit()
+    Log ('  exit code: {0} (0x{0:X8})' -f $p.ExitCode)
+    return $p.ExitCode
+}
+
+function Invoke-WingetBatch([string]$Verb, [object[]]$Apps) {
+    $n = $Apps.Count; $ok = 0; $fail = 0
+    $sync.Prog.Total = $n; $sync.Prog.Index = 0; $sync.Prog.Active = $true
+    foreach ($a in $Apps) { $sync.AppState[$a[0]] = 'queued' }
+    for ($i = 0; $i -lt $n; $i++) {
+        $id = $Apps[$i][0]; $name = $Apps[$i][1]
+        $sync.Prog.Index = $i + 1; $sync.Prog.Name = $name
+        Set-Phase $id 'start' 0 "$Verb $id"
+        Log "[$($i + 1)/$n] $Verb $name ($id)"
+        $wa = if ($Verb -eq 'install') { 'install', '--id', $id, '-e', '--silent', '--accept-source-agreements', '--accept-package-agreements' }
+              else { 'uninstall', '--id', $id, '-e', '--silent', '--accept-source-agreements' }
+        try { $code = [int]@(Invoke-Winget $wa $id)[-1] } catch { Log "  ERROR: $_"; $code = -1 }
+        $phase = if ($code -eq 0) { 'ok' } elseif ($code -eq -1978335189) { 'latest' } elseif ($code -eq -1978334967) { 'reboot' } else { 'fail' }
+        Set-Phase $id $phase 0 "exit code $code"
+        if ($phase -eq 'fail') { $fail++ } else { $ok++ }
+    }
+    $sync.Prog.Name = "Finished: $ok ok, $fail failed"
+    $sync.Prog.Phase = 'finished'; $sync.Prog.Detail = 'details in TERMINAL'; $sync.Prog.Pct = 100
+    Log "Summary: $ok ok, $fail failed"
 }
 '@
 
@@ -462,6 +618,26 @@ function Get-UiFont {
         </ControlTemplate>
       </Setter.Value></Setter>
     </Style>
+    <!-- Thanh tiến trình: track = màu ô nhập, phần đã chạy = Accent (đen ở White, xanh ở Dark) -->
+    <Style TargetType="ProgressBar">
+      <Setter Property="Height" Value="6"/>
+      <Setter Property="Maximum" Value="100"/>
+      <Setter Property="Foreground" Value="{DynamicResource Accent}"/>
+      <Setter Property="Background" Value="{DynamicResource BgInput}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource InputBorder}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Template"><Setter.Value>
+        <ControlTemplate TargetType="ProgressBar">
+          <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                  BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="{DynamicResource Radius}">
+            <!-- ProgressBar tự đặt Width của PART_Indicator theo Value/Maximum -->
+            <Grid x:Name="PART_Track" ClipToBounds="True">
+              <Rectangle x:Name="PART_Indicator" HorizontalAlignment="Left" Fill="{TemplateBinding Foreground}"/>
+            </Grid>
+          </Border>
+        </ControlTemplate>
+      </Setter.Value></Setter>
+    </Style>
     <!-- Ô cửa sổ (tile): sidebar, editor, terminal. Khe hở + viền lấy từ theme. -->
     <Style x:Key="Tile" TargetType="Border">
       <Setter Property="Margin" Value="{DynamicResource TileGap}"/>
@@ -537,6 +713,14 @@ function Get-UiFont {
             <Button Name="BtnUpgrade" Content="Upgrade all apps"/>
             <Button Name="BtnClearApps" Content="Clear selection"/>
             <TextBlock Name="SelCount" Text="0 selected" Foreground="{DynamicResource FgSubtle}" FontSize="11" Margin="0,8,0,0"/>
+            <!-- Panel tiến trình: ẩn cho tới lượt cài/gỡ đầu tiên, sau đó giữ lại kết quả lượt gần nhất -->
+            <StackPanel Name="ProgPanel" Margin="0,22,8,0" Visibility="Collapsed">
+              <TextBlock Style="{StaticResource Head}" Text="PROGRESS" Margin="0,0,0,8"/>
+              <TextBlock Name="ProgApp" FontWeight="Bold" TextTrimming="CharacterEllipsis"/>
+              <TextBlock Name="ProgPhase" Foreground="{DynamicResource FgSubtle}" FontSize="11.5" TextWrapping="Wrap" Margin="0,3,0,8"/>
+              <ProgressBar Name="ProgBar"/>
+              <TextBlock Name="ProgCount" Foreground="{DynamicResource FgSubtle}" FontSize="11" Margin="0,6,0,0"/>
+            </StackPanel>
           </StackPanel>
           <StackPanel Name="SideTweaks" Margin="16,12,8,12" Visibility="Collapsed">
             <TextBlock Style="{StaticResource Head}" Text="TWEAKS"/>
@@ -673,16 +857,23 @@ function New-Ui($type, $style) { $e = New-Object "Windows.Controls.$type"; if ($
 # ----------------------------------------------------------------------------
 #  7. Sinh nội dung động từ dữ liệu ở mục 2
 # ----------------------------------------------------------------------------
-# Trang Install: mỗi danh mục một hộp, mỗi app một checkbox (Tag = winget id)
+# Trang Install: mỗi danh mục một hộp. Mỗi app là một hàng (DockPanel) gồm:
+#   checkbox (Tag = winget id) | nhãn trạng thái bên phải ($AppLabels[id], timer cập nhật)
+# Ô tìm kiếm ẩn/hiện cả hàng (= $cb.Parent).
 $sync.AppBoxes = New-Object Collections.ArrayList
+$AppLabels = @{}
 foreach ($cat in $Apps.Keys) {
     $card = New-Ui Border 'Card'; $sp = New-Object Windows.Controls.StackPanel; $card.Child = $sp
     $h = New-Ui TextBlock 'Comment'; $h.Text = "// $cat"; [void]$sp.Children.Add($h)
     foreach ($a in $Apps[$cat]) {
         $name, $id = $a -split '\|'
-        $cb = New-Object Windows.Controls.CheckBox; $cb.Content = $name; $cb.Tag = $id; $cb.ToolTip = $id
+        $row = New-Object Windows.Controls.DockPanel
+        $st = New-Ui TextBlock 'Desc'; $st.Margin = '8,0,0,0'; $st.TextWrapping = 'NoWrap'; $st.VerticalAlignment = 'Center'
+        [Windows.Controls.DockPanel]::SetDock($st, 'Right')
+        $cb = New-Object Windows.Controls.CheckBox; $cb.Content = $name; $cb.Tag = $id; $cb.ToolTip = $id; $cb.Margin = '0,4,0,4'
         $cb.Add_Click({ $ui.SelCount.Text = "$(@($sync.AppBoxes | Where-Object IsChecked).Count) selected" })
-        [void]$sp.Children.Add($cb); [void]$sync.AppBoxes.Add($cb)
+        [void]$row.Children.Add($st); [void]$row.Children.Add($cb)
+        [void]$sp.Children.Add($row); [void]$sync.AppBoxes.Add($cb); $AppLabels[$id] = $st
     }
     [void]$ui.AppPanel.Children.Add($card)
 }
@@ -757,22 +948,27 @@ $win.Add_StateChanged({
 # Tìm kiếm theo tên hoặc winget id
 $ui.Search.Add_TextChanged({
     $q = $ui.Search.Text.Trim()
-    foreach ($cb in $sync.AppBoxes) { $cb.Visibility = if (!$q -or $cb.Content -like "*$q*" -or $cb.Tag -like "*$q*") { 'Visible' } else { 'Collapsed' } }
+    foreach ($cb in $sync.AppBoxes) { $cb.Parent.Visibility = if (!$q -or $cb.Content -like "*$q*" -or $cb.Tag -like "*$q*") { 'Visible' } else { 'Collapsed' } }
 })
 
-# ---- Install
-$WingetArgs = '"-e","--silent","--accept-source-agreements"'
-$ui.BtnInstall.Add_Click({
-    $ids = @($sync.AppBoxes | Where-Object IsChecked | ForEach-Object Tag)
-    if (!$ids) { Write-Log 'No apps selected.'; return }
-    Invoke-Task 'Install apps' "foreach (`$id in `$ids) { Log `"Installing `$id`"; Invoke-Winget @('install','--id',`$id,$WingetArgs,'--accept-package-agreements') }" @{ ids = $ids }
+# ---- Install / Uninstall / Upgrade
+# Gửi sang luồng nền danh sách @(id, tên) để panel PROGRESS hiện tên thân thiện.
+function Start-AppBatch([string]$Verb) {
+    $sel = @($sync.AppBoxes | Where-Object IsChecked | ForEach-Object { , @($_.Tag, $_.Content) })
+    if (!$sel) { Write-Log 'No apps selected.'; return }
+    Invoke-Task "$Verb $($sel.Count) app(s)" 'Invoke-WingetBatch $verb $apps' @{ verb = $Verb; apps = $sel }
+}
+$ui.BtnInstall.Add_Click({ Start-AppBatch 'install' })
+$ui.BtnUninstall.Add_Click({ Start-AppBatch 'uninstall' })
+# Upgrade all: winget tự liệt kê gói cần nâng cấp, nên coi cả lượt là 1 "app"
+$ui.BtnUpgrade.Add_Click({
+    Invoke-Task 'Upgrade all apps' @'
+$sync.Prog.Active = $true; $sync.Prog.Total = 1; $sync.Prog.Index = 1; $sync.Prog.Name = 'Upgrading all apps'
+$code = [int]@(Invoke-Winget @('upgrade', '--all', '--silent', '--accept-source-agreements', '--accept-package-agreements'))[-1]
+Set-Phase '' $(if ($code -eq 0) { 'ok' } else { 'fail' }) 0 "exit code $code"
+$sync.Prog.Name = 'Upgrade finished'
+'@
 })
-$ui.BtnUninstall.Add_Click({
-    $ids = @($sync.AppBoxes | Where-Object IsChecked | ForEach-Object Tag)
-    if (!$ids) { Write-Log 'No apps selected.'; return }
-    Invoke-Task 'Uninstall apps' "foreach (`$id in `$ids) { Log `"Uninstalling `$id`"; Invoke-Winget @('uninstall','--id',`$id,$WingetArgs) }" @{ ids = $ids }
-})
-$ui.BtnUpgrade.Add_Click({ Invoke-Task 'Upgrade all apps' "Invoke-Winget @('upgrade','--all','--silent','--accept-source-agreements','--accept-package-agreements')" })
 $ui.BtnClearApps.Add_Click({ $sync.AppBoxes | ForEach-Object { $_.IsChecked = $false }; $ui.SelCount.Text = '0 selected' })
 
 # ---- Tweaks
@@ -824,6 +1020,29 @@ $ui.BtnClearLog.Add_Click({ $ui.Log.Clear() })
 # ----------------------------------------------------------------------------
 # Khi Busy đổi: trỏ nền bar/badge sang token khác bằng SetResourceReference
 # (không gán brush cứng), nên đổi theme giữa chừng vẫn đúng màu.
+# Trạng thái trong AppState (chữ ASCII từ luồng nền) -> nhãn hiển thị, thêm dấu ✓ / ✗
+$Tick = [string][char]0x2713; $Cross = [string][char]0x2717
+function Format-AppState([string]$s) {
+    switch ($s) {
+        'done'          { "$Tick done" }
+        'up to date'    { "$Tick latest" }
+        'done (reboot)' { "$Tick reboot" }
+        'failed'        { "$Cross failed" }
+        default         { $s }
+    }
+}
+
+# Đồng bộ nhãn cạnh từng app với $sync.AppState.
+# PHẢI dùng .GetEnumerator(): `foreach ($x in <dictionary>)` của PowerShell coi cả dictionary
+# là MỘT phần tử, không duyệt từng cặp key/value. ConcurrentDictionary cho phép duyệt an toàn
+# trong khi luồng nền đang ghi.
+function Update-AppLabels {
+    foreach ($kv in $sync.AppState.GetEnumerator()) {
+        $lbl = $AppLabels[$kv.Key]
+        if ($lbl) { $t = Format-AppState $kv.Value; if ($lbl.Text -ne $t) { $lbl.Text = $t } }
+    }
+}
+
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromMilliseconds(150)
 $timer.Add_Tick({
@@ -839,8 +1058,22 @@ $timer.Add_Tick({
         $k = if ($sync.Busy) { 'Busy' } else { '' }
         $ui.StatusBar.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, "Status${k}Bg")
         $ui.StatusBadge.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, "Badge${k}Bg")
-        $ui.StatusText.Text = if ($sync.Busy) { "RUNNING: $($sync.Task)" } else { 'READY' }
     }
+
+    # Tiến trình cài/gỡ app: panel PROGRESS + nhãn cạnh từng app + thanh trạng thái
+    $p = $sync.Prog
+    $batch = $p.Active -and $p.Phase -ne 'finished'
+    $ui.StatusText.Text = if (-not $sync.Busy) { 'READY' }
+                          elseif ($batch) { "RUNNING: $($p.Name) [$($p.Index)/$($p.Total)] $($p.Pct)%" }
+                          else { "RUNNING: $($sync.Task)" }
+    if ($p.Active) {
+        $ui.ProgPanel.Visibility = 'Visible'
+        $ui.ProgApp.Text   = $p.Name
+        $ui.ProgPhase.Text = if ($p.Detail) { "$($p.Phase)`n$($p.Detail)" } else { $p.Phase }
+        $ui.ProgBar.Value  = $p.Pct
+        $ui.ProgCount.Text = "$($p.Index) / $($p.Total)   $($p.Pct)%"
+    }
+    Update-AppLabels
 })
 $win.Add_Closed({ $timer.Stop() })
 
@@ -876,6 +1109,27 @@ if ($IsTest) {
     try { Get-Theme 'omarchy-white' | Out-Null; throw 'contract check did not reject an empty theme' }
     catch { if ("$_" -notlike '*missing keys*') { throw } ; 'contract ok: empty theme rejected' }
     ${function:Get-ThemeXaml} = $origGet
+
+    # Bộ phân tích output winget: nạp $Prelude vào phiên hiện tại rồi đưa vào các dòng mẫu.
+    # App 1/2, tải 12/48 MB = 25% -> trọng số 10 + 0.6*25 = 25 -> tổng (0*100 + 25)/2 = 12%
+    . ([scriptblock]::Create($Prelude))
+    $sync.Prog.Total = 2; $sync.Prog.Index = 1
+    Read-WingetLine ("  " + [string][char]0x2588 * 8 + "  12.0 MB / 48.0 MB") 'Test.App'
+    if ($sync.AppState['Test.App'] -ne '25%' -or $sync.Prog.Pct -ne 12 -or $sync.Prog.Detail -ne '12.0 MB / 48.0 MB') {
+        throw "download parse failed: state=$($sync.AppState['Test.App']) pct=$($sync.Prog.Pct) detail=$($sync.Prog.Detail)"
+    }
+    Read-WingetLine 'Successfully verified installer hash' 'Test.App'
+    if ($sync.AppState['Test.App'] -ne 'verifying') { throw 'phase parse failed' }
+    Read-WingetLine ([string][char]0x2588 * 5 + '  |') 'Test.App'   # spinner: phải bị bỏ qua
+    if ($sync.AppState['Test.App'] -ne 'verifying') { throw 'spinner line changed state' }
+    if ((Format-AppState 'failed') -ne "$Cross failed") { throw 'label format failed' }
+    # Nhãn cạnh app phải được cập nhật từ AppState
+    $sync.AppState['Google.Chrome'] = 'done'; $sync.AppState['Brave.Brave'] = '45%'
+    Update-AppLabels
+    if ($AppLabels['Google.Chrome'].Text -ne "$Tick done" -or $AppLabels['Brave.Brave'].Text -ne '45%') {
+        throw "app labels not updated: '$($AppLabels['Google.Chrome'].Text)' '$($AppLabels['Brave.Brave'].Text)'"
+    }
+    'parser ok: download %, phases, spinner filter, app labels'
     "OK: $($sync.AppBoxes.Count) apps, $($sync.TweakBoxes.Count) tweaks, font=$($win.FontFamily.Source)"
     return
 }

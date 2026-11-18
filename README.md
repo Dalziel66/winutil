@@ -18,6 +18,8 @@ powershell -c "irm https://raw.githubusercontent.com/Dalziel66/winutil/main/winu
 
 The script asks for administrator rights and relaunches itself. Press **Ctrl+T** (or the ☀ button) to switch theme. The choice is remembered.
 
+While apps install, the **PROGRESS** panel shows the current app, phase (found → downloading → verifying → installing), live download size, % and speed, and `n / total`. Each app row shows its own state (`queued`, `45%`, `✓ done`, `✗ failed`). Download progress is read from Windows Delivery Optimization, because winget does not print its progress bar when its output is redirected.
+
 ## Project layout
 
 ```
