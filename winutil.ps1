@@ -1,6 +1,6 @@
 # WinUtil - Windows utility (VS Code style UI)
-# Run:  irm https://raw.githubusercontent.com/YOUR_USER/winutil/main/winutil.ps1 | iex
-$ScriptUrl = 'https://raw.githubusercontent.com/YOUR_USER/winutil/main/winutil.ps1'
+# Run:  irm https://raw.githubusercontent.com/Dalziel66/winutil/main/winutil.ps1 | iex
+$ScriptUrl = 'https://raw.githubusercontent.com/Dalziel66/winutil/main/winutil.ps1'
 
 $IsTest = $env:WINUTIL_TEST -eq '1'   # self-check: build the window without showing it
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
