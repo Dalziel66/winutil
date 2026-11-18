@@ -18,10 +18,9 @@ powershell -c "irm https://raw.githubusercontent.com/Dalziel66/winutil/main/winu
 
 The script asks for administrator rights and relaunches itself.
 
-## Publish
+## Fork
 
-1. Create a public GitHub repo named `winutil` and push `winutil.ps1`.
-2. Replace `Dalziel66` in `$ScriptUrl` (line 3 of winutil.ps1) and in this README.
+If you fork this repo, change `$ScriptUrl` (line 3 of winutil.ps1) to your own raw URL.
 
 ## Self-check
 
